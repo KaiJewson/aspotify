@@ -40,10 +40,11 @@ use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use reqwest::{header, RequestBuilder, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::Mutex;
 
 pub use authorization_url::*;
 pub use endpoints::*;
@@ -58,96 +59,29 @@ pub mod endpoints;
 pub mod model;
 mod util;
 
-/// A client to the Spotify API.
-///
-/// By default it will use the [client credentials
-/// flow](https://developer.spotify.com/documentation/general/guides/authorization-guide/#client-credentials-flow)
-/// to send requests to the Spotify API. The [`set_refresh_token`](Client::set_refresh_token) and
-/// [`redirected`](Client::redirected) methods tell it to use the [authorization code
-/// flow](https://developer.spotify.com/documentation/general/guides/authorization-guide/#authorization-code-flow)
-/// instead.
-#[derive(Debug)]
-pub struct Client {
-    /// Your Spotify client credentials.
-    pub credentials: ClientCredentials,
-    client: reqwest::Client,
-    cache: Mutex<AccessToken>,
-    debug: bool,
+#[async_trait]
+pub trait Authenticator {
+    async fn get_token(&self, client: &reqwest::Client) -> Result<String, Error>;
 }
 
-impl Client {
-    /// Create a new client from your Spotify client credentials.
-    #[must_use]
-    pub fn new(credentials: ClientCredentials) -> Self {
+pub struct ApiAuthenticator {
+    credentials: ClientCredentials,
+    cache: Mutex<AccessToken>,
+}
+
+impl ApiAuthenticator {
+    pub fn with_credentials(credentials: ClientCredentials) -> Self {
         Self {
             credentials,
-            client: reqwest::Client::new(),
-            cache: Mutex::new(AccessToken::new(None)),
-            debug: false,
+            cache: Mutex::new(AccessToken::expired()),
         }
     }
-    /// Create a new client with your Spotify client credentials and a refresh token.
-    #[must_use]
-    pub fn with_refresh(credentials: ClientCredentials, refresh_token: String) -> Self {
+
+    pub fn with_refresh_token(credentials: ClientCredentials, refresh_token: String) -> Self {
         Self {
             credentials,
-            client: reqwest::Client::new(),
-            cache: Mutex::new(AccessToken::new(Some(refresh_token))),
-            debug: false,
+            cache: Mutex::new(AccessToken::expired_with_refresh(refresh_token)),
         }
-    }
-    /// Get the client's refresh token.
-    pub async fn refresh_token(&self) -> Option<String> {
-        self.cache.lock().await.refresh_token.clone()
-    }
-    /// Set the client's refresh token.
-    pub async fn set_refresh_token(&self, refresh_token: Option<String>) {
-        self.cache.lock().await.refresh_token = refresh_token;
-    }
-    /// Get the client's access token values.
-    pub async fn current_access_token(&self) -> (String, Instant) {
-        let cache = self.cache.lock().await;
-        (cache.token.clone(), cache.expires)
-    }
-    /// Explicitly override the client's access token values. Useful if you acquire the
-    /// access token elsewhere.
-    pub async fn set_current_access_token(&self, token: String, expires: Instant) {
-        let mut cache = self.cache.lock().await;
-        cache.token = token;
-        cache.expires = expires;
-    }
-
-    async fn token_request(&self, params: TokenRequest<'_>) -> Result<AccessToken, Error> {
-        let request = self
-            .client
-            .post("https://accounts.spotify.com/api/token")
-            .basic_auth(&self.credentials.id, Some(&self.credentials.secret))
-            .form(&params)
-            .build()?;
-
-        if self.debug {
-            dbg!(&request, body_str(&request));
-        }
-
-        let response = self.client.execute(request).await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            if self.debug {
-                eprintln!(
-                    "Authentication failed ({}). Response body is '{}'",
-                    status, text
-                );
-            }
-            return Err(Error::Auth(serde_json::from_str(&text)?));
-        }
-
-        if self.debug {
-            dbg!(status);
-            eprintln!("Authentication response body is '{}'", text);
-        }
-
-        Ok(serde_json::from_str(&text)?)
     }
 
     /// Set the refresh token from the URL the client was redirected to and the state that was used
@@ -191,33 +125,139 @@ impl Client {
         Ok(())
     }
 
-    async fn access_token(&self) -> Result<MutexGuard<'_, AccessToken>, Error> {
-        let mut cache = self.cache.lock().await;
-        if Instant::now() >= cache.expires {
-            *cache = match cache.refresh_token.take() {
-                // Authorization code flow
-                Some(refresh_token) => {
-                    let mut token = self
-                        .token_request(TokenRequest::RefreshToken {
-                            refresh_token: &refresh_token,
-                        })
-                        .await?;
-                    token.refresh_token = Some(refresh_token);
-                    token
-                }
-                // Client credentials flow
-                None => self.token_request(TokenRequest::ClientCredentials).await?,
-            }
+    async fn request_token(
+        &self,
+        client: &reqwest::Client,
+        params: TokenRequest<'_>,
+    ) -> Result<AccessToken, Error> {
+        let request = client
+            .post("https://accounts.spotify.com/api/token")
+            .basic_auth(&self.credentials.id, Some(&self.credentials.secret))
+            .form(&params)
+            .build()?;
+        if cfg!(test) {
+            dbg!(&request, body_str(&request));
         }
-        Ok(cache)
+
+        let response = client.execute(request).await?;
+        let status = response.status();
+        let text = response.text().await?;
+
+        if status.is_success() {
+            if cfg!(test) {
+                eprintln!("Authentication response body is '{}'", text);
+            }
+            let token = serde_json::from_str(&text)?;
+            Ok(token)
+        } else {
+            if cfg!(test) {
+                eprintln!(
+                    "Authentication failed ({}). Response body is '{}'",
+                    status, text
+                );
+            }
+            let auth_error = serde_json::from_str(&text)?;
+            Err(Error::Auth(auth_error))
+        }
+    }
+}
+
+#[async_trait]
+impl Authenticator for ApiAuthenticator {
+    async fn get_token(&self, client: &reqwest::Client) -> Result<String, Error> {
+        let mut cache = self.cache.lock().await;
+
+        if cache.is_expired() {
+            let token_request = match cache.refresh_token.as_ref() {
+                // Use refresh token for re-newing the access token.
+                Some(refresh) => TokenRequest::RefreshToken {
+                    refresh_token: refresh,
+                },
+                // Use credential authentication.
+                None => TokenRequest::ClientCredentials,
+            };
+            *cache = self.request_token(client, token_request).await?;
+        }
+
+        Ok(cache.token.clone())
+    }
+}
+
+pub struct ClientBuilder<T: Authenticator> {
+    client: Option<reqwest::Client>,
+    authenticator: Option<T>,
+}
+
+impl<T: Authenticator> ClientBuilder<T> {
+    pub fn new() -> Self {
+        Self {
+            client: None,
+            authenticator: None,
+        }
+    }
+
+    pub fn client(mut self, client: reqwest::Client) -> Self {
+        self.client.replace(client);
+        self
+    }
+
+    pub fn authenticator(mut self, authenticator: T) -> Self {
+        self.authenticator.replace(authenticator);
+        self
+    }
+
+    pub fn build(self) -> Client<T> {
+        Client {
+            client: self.client.unwrap_or_default(),
+            authenticator: self.authenticator.unwrap(),
+        }
+    }
+}
+
+/// A client to the Spotify API.
+///
+/// By default it will use the [client credentials
+/// flow](https://developer.spotify.com/documentation/general/guides/authorization-guide/#client-credentials-flow)
+/// to send requests to the Spotify API. The [`set_refresh_token`](Client::set_refresh_token) and
+/// [`redirected`](Client::redirected) methods tell it to use the [authorization code
+/// flow](https://developer.spotify.com/documentation/general/guides/authorization-guide/#authorization-code-flow)
+/// instead.
+#[derive(Debug)]
+pub struct Client<T: Authenticator> {
+    client: reqwest::Client,
+    authenticator: T,
+}
+
+impl<T: Authenticator> Client<T> {
+    /// Create a new client from your Spotify client credentials.
+    #[must_use]
+    pub fn new(credentials: ClientCredentials) -> Self {
+        ClientBuilder::new()
+            .authenticator(ApiAuthenticator::with_credentials(credentials))
+            .build()
+    }
+
+    /// Create a new client with your Spotify client credentials and a refresh token.
+    #[must_use]
+    pub fn with_refresh(credentials: ClientCredentials, refresh_token: String) -> Self {
+        ClientBuilder::new()
+            .authenticator(ApiAuthenticator::with_refresh_token(
+                credentials,
+                refresh_token,
+            ))
+            .build()
+    }
+
+    pub fn authenticator(&self) -> &T {
+        &self.authenticator
     }
 
     async fn send_text(&self, request: RequestBuilder) -> Result<Response<String>, Error> {
         let request = request
-            .bearer_auth(&self.access_token().await?.token)
+            .bearer_auth(&self.authenticator.get_token(&self.client).await?.token)
             .build()?;
 
-        if self.debug {
+        if cfg!(test) {
             dbg!(&request, body_str(&request));
         }
 
@@ -234,7 +274,7 @@ impl Client {
             // 2 seconds is default retry after time; should never be used if the Spotify API and
             // my code are both correct.
             let wait = wait.unwrap_or(2);
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            tokio::time::sleep(Duration::from_secs(wait)).await;
         };
         let status = response.status();
         let cache_control = Duration::from_secs(
@@ -257,13 +297,13 @@ impl Client {
 
         let data = response.text().await?;
         if !status.is_success() {
-            if self.debug {
+            if cfg!(test) {
                 eprintln!("Failed ({}). Response body is '{}'", status, data);
             }
             return Err(Error::Endpoint(serde_json::from_str(&data)?));
         }
 
-        if self.debug {
+        if cfg!(test) {
             dbg!(status);
             eprintln!("Response body is '{}'", data);
         }
@@ -279,10 +319,10 @@ impl Client {
         Ok(())
     }
 
-    async fn send_opt_json<T: DeserializeOwned>(
+    async fn send_opt_json<U: DeserializeOwned>(
         &self,
         request: RequestBuilder,
-    ) -> Result<Response<Option<T>>, Error> {
+    ) -> Result<Response<Option<U>>, Error> {
         let res = self.send_text(request).await?;
         Ok(Response {
             data: if res.data.is_empty() {
@@ -294,10 +334,10 @@ impl Client {
         })
     }
 
-    async fn send_json<T: DeserializeOwned>(
+    async fn send_json<U: DeserializeOwned>(
         &self,
         request: RequestBuilder,
-    ) -> Result<Response<T>, Error> {
+    ) -> Result<Response<U>, Error> {
         let res = self.send_text(request).await?;
         Ok(Response {
             data: serde_json::from_str(&res.data)?,
@@ -396,6 +436,13 @@ impl ClientCredentials {
     pub fn from_env() -> Result<Self, VarError> {
         Self::from_env_vars("CLIENT_ID", "CLIENT_SECRET")
     }
+
+    pub fn empty() -> Self {
+        Self {
+            id: String::new(),
+            secret: String::new(),
+        }
+    }
 }
 
 /// An error caused by the [`Client::redirected`] function.
@@ -418,6 +465,7 @@ impl From<url::ParseError> for RedirectedError {
         Self::InvalidUrl(error)
     }
 }
+
 impl From<Error> for RedirectedError {
     fn from(error: Error) -> Self {
         Self::Token(error)
@@ -449,7 +497,7 @@ impl StdError for RedirectedError {
 #[serde(tag = "grant_type", rename_all = "snake_case")]
 enum TokenRequest<'a> {
     RefreshToken {
-        refresh_token: &'a String,
+        refresh_token: &'a str,
     },
     ClientCredentials,
     AuthorizationCode {
@@ -472,12 +520,24 @@ struct AccessToken {
 }
 
 impl AccessToken {
-    fn new(refresh_token: Option<String>) -> Self {
+    fn expired_with_refresh(refresh_token: String) -> Self {
         Self {
             token: String::new(),
             expires: Instant::now() - Duration::from_secs(1),
-            refresh_token,
+            refresh_token: Some(refresh_token),
         }
+    }
+
+    fn expired() -> Self {
+        Self {
+            token: String::new(),
+            expires: Instant::now() - Duration::from_secs(1),
+            refresh_token: None,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.expires <= Instant::now()
     }
 }
 
